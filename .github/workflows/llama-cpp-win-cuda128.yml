@@ -1,0 +1,141 @@
+name: llama.cpp Windows CUDA 12.8 backend
+
+# Builds the ggml-cuda backend with the CUDA 12.8 toolkit.
+# Why: upstream Windows releases only ship cu12.4 (no sm_120 code) and cu13.4
+#      (needs driver >= 580). CUDA 12.8 is the newest runtime that a R573
+#      driver accepts AND is the first version that can emit sm_120 kernels.
+# Result: a ready-to-use zip = official release binaries + cu12.8 ggml-cuda.dll
+#         + matching CUDA 12.8 runtime DLLs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'llama.cpp tag to build. Must match the release you merge into.'
+        required: true
+        default: 'b11178'
+      cuda_arch:
+        description: 'CMAKE_CUDA_ARCHITECTURES. ggml rewrites 120 to 120a automatically.'
+        required: true
+        default: '120'
+
+jobs:
+  build:
+    name: build ggml-cuda (cu12.8)
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone llama.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+
+      - name: Install CUDA Toolkit 12.8.1 (redistributable)
+        shell: pwsh
+        run: |
+          $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          $base = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $pkgs = @(
+            "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.8.90-archive.zip",
+            "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.8.93-archive.zip",
+            "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.8.93-archive.zip",
+            "libcublas/windows-x86_64/libcublas-windows-x86_64-12.8.4.1-archive.zip",
+            "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-12.8.90-archive.zip",
+            "cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.8.90-archive.zip",
+            "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-12.8.90-archive.zip",
+            "visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-12.8.90-archive.zip"
+          )
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          choco install unzip -y --no-progress
+          foreach ($p in $pkgs) {
+            $url  = "$base/$p"
+            $file = Split-Path $p -Leaf
+            Write-Host "downloading $url"
+            curl.exe -L --retry 3 -o "$file" "$url"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $url" }
+            unzip -q -o "$file" -d "$root"
+            if ($LASTEXITCODE -ne 0) { throw "unzip failed: $file" }
+            Remove-Item "$file"
+          }
+          Get-ChildItem -Path "$root" -Directory -Filter "*-archive" | ForEach-Object {
+            xcopy "$($_.FullName)\*" "$root" /E /I /H /Y | Out-Null
+          }
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CUDA_PATH_V12_8=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & "$root\bin\nvcc.exe" --version
+
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+
+      - name: Configure and build ggml-cuda
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=${{ inputs.cuda_arch }} ^
+            -DLLAMA_BUILD_BORINGSSL=ON > configure.log 2>&1
+          type configure.log
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Report architecture set
+        shell: cmd
+        run: findstr /I /C:"CMAKE_CUDA_ARCHITECTURES" configure.log || echo "line not found"
+
+      - name: Collect backend and runtime DLLs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item "build\bin\Release\ggml-cuda.dll" out\
+          Copy-Item "$env:CUDA_PATH\bin\cudart64_*.dll" out\
+          Copy-Item "$env:CUDA_PATH\bin\cublas64_*.dll" out\
+          Copy-Item "$env:CUDA_PATH\bin\cublasLt64_*.dll" out\
+          Get-ChildItem out | Select-Object Name, Length
+
+      - name: Upload backend bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: ggml-cuda-cu12.8-x64
+          path: out\*
+          retention-days: 30
+
+  package:
+    name: merge into official release zip
+    needs: build
+    runs-on: windows-2022
+
+    steps:
+      - name: Download backend bundle
+        uses: actions/download-artifact@v7
+        with:
+          name: ggml-cuda-cu12.8-x64
+          path: backend
+
+      - name: Replace CUDA backend in official zip
+        shell: pwsh
+        run: |
+          $ref = "${{ inputs.ref }}"
+          $url = "https://github.com/ggml-org/llama.cpp/releases/download/$ref/llama-$ref-bin-win-cuda-13.4-x64.zip"
+          Write-Host "fetching $url"
+          Invoke-WebRequest -Uri $url -OutFile base.zip
+          Expand-Archive -Path base.zip -DestinationPath base -Force
+          Remove-Item -Path "base\ggml-cuda.dll" -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "base\cudart64_*.dll", "base\cublas64_*.dll", "base\cublasLt64_*.dll" -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "backend\*" -Destination base -Force
+          $out = "llama-$ref-win-cuda-12.8-x64.zip"
+          Compress-Archive -Path "base\*" -DestinationPath $out
+          Get-Item $out | Select-Object Name, Length
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-win-cuda-12.8-x64
+          path: llama-*-win-cuda-12.8-x64.zip
+          retention-days: 30
