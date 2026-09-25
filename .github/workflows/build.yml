@@ -64,6 +64,7 @@ jobs:
           $dest = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$ver"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           choco install unzip -y
+          choco install ninja -y
           $base = "https://developer.download.nvidia.com/compute/cuda/redist"
           $pkgs = switch ($ver) {
             "12.8" {
@@ -100,12 +101,29 @@ jobs:
         shell: pwsh
         run: nvcc --version
 
+      # 兜底：把 CUDA 的 MSBuild 集成文件放进 VS。
+      # 使用 Visual Studio 生成器时必须有它，否则 enable_language(CUDA) 报 "No CUDA toolset found"。
+      # 我们主用 Ninja（不需要它），但装上可以顺便兼容 VS 生成器。
+      - name: Install CUDA MSBuild integration (safety net)
+        shell: pwsh
+        run: |
+          $src = "$env:CUDA_PATH\visual_studio_integration\MSBuildExtensions"
+          $dst = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\BuildCustomizations"
+          if ((Test-Path $src) -and (Test-Path $dst)) {
+            Copy-Item "$src\*" $dst -Force
+            Get-ChildItem $dst -Filter "*12.8*" | Select-Object -ExpandProperty Name
+          } else {
+            Write-Host "跳过：src=$src 或 dst=$dst 不存在（Ninja 生成器不依赖它）"
+          }
+
       # 官方要求：加载 MSVC 环境变量（等价于 Developer Command Prompt）
+      # 关键：用 Ninja Multi-Config，和官方 release.yml 的 windows-cuda job 完全一致。
+      # 默认的 Visual Studio 生成器会去 MSBuild 找 CUDA toolset，redist 拼装的 toolkit 没注册就会失败。
       - name: Configure
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES="${{ github.event.inputs.cuda_archs || '120a' }}"
+          cmake -B build -G "Ninja Multi-Config" -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES="${{ github.event.inputs.cuda_archs || '120a' }}"
 
       - name: Show resolved CUDA architectures
         shell: cmd
